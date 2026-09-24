@@ -2,5 +2,5 @@
   "name": "Bluepay Reimbursement Engine",
   "description": "Automated OCR and AI reimbursement processing pipeline following the strict Bluepay audit workflow with SEFAZ validation, fraud detection, and policy rules.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }

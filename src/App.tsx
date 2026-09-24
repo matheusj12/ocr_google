@@ -5,12 +5,15 @@ import {
   ReceiptSubmissionInput,
   StepExecutionLog,
   StepId,
+  StructuredReceiptData,
 } from './types/bluepay';
 import { SAMPLE_RECEIPTS, SampleReceiptDefinition } from './data/sampleReceipts';
 import { FlowchartVisualizer } from './components/FlowchartVisualizer';
 import { ReceiptInspector } from './components/ReceiptInspector';
 import { HumanReviewModal } from './components/HumanReviewModal';
 import { AuditTrailTable } from './components/AuditTrailTable';
+import { BluepayEngine, DEFAULT_POLICY } from './pipeline/bluepayEngine';
+import { extractReceiptClientSide } from './services/receiptExtractor';
 import {
   Play,
   UploadCloud,
@@ -27,6 +30,8 @@ import {
   ChevronRight,
   ShieldAlert,
   Sliders,
+  Trash2,
+  Zap,
 } from 'lucide-react';
 
 const BRAZILIAN_UFS: BrazilianUF[] = [
@@ -34,6 +39,8 @@ const BRAZILIAN_UFS: BrazilianUF[] = [
   'MA', 'MT', 'MS', 'MG', 'PA', 'PB', 'PR', 'PE', 'PI',
   'RJ', 'RN', 'RS', 'RO', 'RR', 'SC', 'SP', 'SE', 'TO',
 ];
+
+const LOCAL_STORAGE_KEY = 'bluepay_audit_records';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'runner' | 'flowchart' | 'review' | 'audit' | 'settings'>('runner');
@@ -58,17 +65,31 @@ export default function App() {
   const [employeeCpf, setEmployeeCpf] = useState<string>('700.705.441-23');
   const [policyCategory, setPolicyCategory] = useState<'food' | 'fuel' | 'travel' | 'office'>('food');
 
-  // Load audit history on mount
+  // Load audit history from localStorage on initial render
   useEffect(() => {
-    fetch('/api/audit-trail')
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.history) {
-          setHistoryRecords(data.history);
+    try {
+      const stored = localStorage.getItem(LOCAL_STORAGE_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setHistoryRecords(parsed);
+          return;
         }
-      })
-      .catch(() => {});
+      }
+    } catch (e) {
+      console.warn('Could not load stored audit trail:', e);
+    }
   }, []);
+
+  // Save history records to localStorage on changes
+  const saveRecords = (records: FinalResult[]) => {
+    setHistoryRecords(records);
+    try {
+      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(records));
+    } catch (e) {
+      console.warn('Could not save audit trail to localStorage:', e);
+    }
+  };
 
   // Handle custom receipt upload
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -78,6 +99,7 @@ export default function App() {
     setErrorNotice(null);
     const fileType = file.type || 'image/jpeg';
     const reader = new FileReader();
+
     reader.onload = (event) => {
       const base64 = event.target?.result as string;
 
@@ -116,7 +138,7 @@ export default function App() {
     reader.readAsDataURL(file);
   };
 
-  // Run the complete 22-step pipeline
+  // Run the complete 22-step pipeline purely in the client frontend
   const runPipeline = async (submissionPayload: ReceiptSubmissionInput) => {
     setIsProcessing(true);
     setCurrentStepId('SUBMISSION');
@@ -124,29 +146,43 @@ export default function App() {
     setErrorNotice(null);
 
     try {
-      const response = await fetch('/api/pipeline/process', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(submissionPayload),
+      // 1. Configure the custom AI/OCR extractor for client-side execution
+      let customAiExtractor: ((inp: ReceiptSubmissionInput) => Promise<StructuredReceiptData>) | undefined;
+
+      if (submissionPayload.samplePreloadId) {
+        const match = SAMPLE_RECEIPTS.find((s) => s.id === submissionPayload.samplePreloadId);
+        if (match) {
+          customAiExtractor = async () => match.extractedMock;
+        }
+      } else {
+        customAiExtractor = async (inp) => {
+          return await extractReceiptClientSide(
+            inp.filename,
+            inp.fileBase64,
+            inp.imageDimensions,
+            inp.fileSizeKb
+          );
+        };
+      }
+
+      // 2. Instantiate and execute the Bluepay Engine directly in the frontend
+      const engine = new BluepayEngine();
+      const result = await engine.executeFlow(submissionPayload, {
+        aiExtractor: customAiExtractor,
       });
 
-      const data = await response.json();
-      if (!data.success) {
-        throw new Error(data.error || 'Failed to process receipt');
-      }
-
-      const result: FinalResult = data.result;
-
-      // Animate stepping through the execution trail for visual compliance
+      // 3. Animate stepping through each node in the execution trail for visual clarity
       for (const log of result.executionTrail) {
         setCurrentStepId(log.stepId);
-        await new Promise((resolve) => setTimeout(resolve, 180));
+        await new Promise((resolve) => setTimeout(resolve, 150));
       }
 
+      // 4. Update active result and audit history
       setActiveResult(result);
-      setHistoryRecords((prev) => [result, ...prev.filter((r) => r.submissionId !== result.submissionId)]);
+      const updatedHistory = [result, ...historyRecords.filter((r) => r.submissionId !== result.submissionId)];
+      saveRecords(updatedHistory);
     } catch (err: any) {
-      console.error('Error executing pipeline:', err);
+      console.error('Error executing pipeline in frontend:', err);
       setErrorNotice(err.message || 'Falha ao executar pipeline');
     } finally {
       setIsProcessing(false);
@@ -154,6 +190,7 @@ export default function App() {
     }
   };
 
+  // Resolve Human Review (Análise Humana) purely in the client frontend
   const handleResolveHumanReview = async (decision: {
     submissionId: string;
     action: 'APPROVE_INTEGRAL' | 'APPROVE_PARTIAL' | 'REJECT' | 'REQUEST_RESUBMIT';
@@ -161,22 +198,75 @@ export default function App() {
     justification: string;
     reviewerName: string;
   }) => {
-    const response = await fetch('/api/human-review/resolve', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(decision),
+    const updated = historyRecords.map((record) => {
+      if (record.submissionId !== decision.submissionId) return record;
+
+      let finalStatus: FinalResult['status'];
+      let finalEligibleAmount = record.eligibleAmount;
+
+      switch (decision.action) {
+        case 'APPROVE_INTEGRAL':
+          finalStatus = 'Aprovado';
+          finalEligibleAmount = record.provenAmount;
+          break;
+        case 'APPROVE_PARTIAL':
+          finalStatus = 'Aprovado parcialmente';
+          finalEligibleAmount =
+            typeof decision.overrideEligibleAmount === 'number'
+              ? decision.overrideEligibleAmount
+              : record.eligibleAmount;
+          break;
+        case 'REJECT':
+          finalStatus = 'Reprovado';
+          finalEligibleAmount = 0;
+          break;
+        case 'REQUEST_RESUBMIT':
+          finalStatus = 'Novo envio solicitado';
+          finalEligibleAmount = 0;
+          break;
+        default:
+          finalStatus = record.status;
+      }
+
+      const updatedRecord: FinalResult = {
+        ...record,
+        status: finalStatus,
+        eligibleAmount: finalEligibleAmount,
+        humanReviewRequired: false,
+        humanReviewDecision: {
+          reviewerName: decision.reviewerName,
+          decidedAt: new Date().toISOString(),
+          action: decision.action,
+          overrideEligibleAmount: finalEligibleAmount,
+          justification: decision.justification,
+        },
+        executionTrail: [
+          ...record.executionTrail,
+          {
+            stepId: 'RESULT_STATUS',
+            name: `Human Review Completed: ${finalStatus}`,
+            namePt: `Análise Humana Concluída: ${finalStatus}`,
+            status: 'passed',
+            timestamp: new Date().toISOString(),
+            durationMs: 10,
+            details: `Auditor ${decision.reviewerName} decidiu status "${finalStatus}". Valor elegível final: R$ ${finalEligibleAmount.toFixed(2)}. Justificativa: ${decision.justification}`,
+          },
+        ],
+      };
+
+      if (activeResult?.submissionId === updatedRecord.submissionId) {
+        setActiveResult(updatedRecord);
+      }
+
+      return updatedRecord;
     });
 
-    const data = await response.json();
-    if (data.success && data.result) {
-      const updated: FinalResult = data.result;
-      if (activeResult?.submissionId === updated.submissionId) {
-        setActiveResult(updated);
-      }
-      setHistoryRecords((prev) =>
-        prev.map((r) => (r.submissionId === updated.submissionId ? updated : r))
-      );
-    }
+    saveRecords(updated);
+  };
+
+  const handleClearHistory = () => {
+    saveRecords([]);
+    setActiveResult(null);
   };
 
   const pendingReviewCount = historyRecords.filter((r) => r.humanReviewRequired).length;
@@ -196,11 +286,11 @@ export default function App() {
                   Bluepay
                 </span>
                 <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-cyan-950 text-cyan-300 border border-cyan-800">
-                  OCR / IA Reembolso
+                  OCR / Reembolso Frontend
                 </span>
               </div>
               <p className="text-[11px] text-slate-400">
-                Motor de Auditoria Fiscal & Decisão Automatizada
+                Motor de Auditoria Fiscal & Decisão Automatizada (100% Client-Side)
               </p>
             </div>
           </div>
@@ -264,11 +354,11 @@ export default function App() {
             </button>
           </nav>
 
-          {/* SEFAZ Status Pill */}
+          {/* Engine Status Indicator */}
           <div className="flex items-center gap-2 text-xs">
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            <span className="text-slate-300 font-medium hidden sm:inline">SEFAZ 27 UFs:</span>
-            <span className="text-emerald-400 font-bold">Online</span>
+            <span className="text-slate-300 font-medium hidden sm:inline">Motor Frontend:</span>
+            <span className="text-emerald-400 font-bold">100% Ativo</span>
           </div>
         </div>
       </header>
@@ -295,7 +385,7 @@ export default function App() {
 
             {/* Top Row: Intake Card + 1-Click Samples */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              {/* Left Column: Sample Receipts representing the user's provided photos */}
+              {/* Left Column: Sample Receipts representing real test scenarios */}
               <div className="lg:col-span-1 bg-white border border-slate-200 rounded-2xl p-5 shadow-xs space-y-4">
                 <div className="flex items-center justify-between">
                   <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
@@ -306,7 +396,7 @@ export default function App() {
                   </span>
                 </div>
                 <p className="text-xs text-slate-500">
-                  Selecione um dos recibos reais fornecidos para percorrer as diferentes rotas do fluxograma:
+                  Selecione um dos recibos reais para testar as ramificações do fluxograma, ou envie um arquivo novo:
                 </p>
 
                 <div className="space-y-2 max-h-[360px] overflow-y-auto pr-1">
@@ -344,7 +434,7 @@ export default function App() {
                       Entrada de Comprovante & Dados do Colaborador
                     </h3>
                     <p className="text-xs text-slate-500">
-                      Dispare a esteira completa com verificação fiscal SEFAZ e OCR
+                      Dispare a esteira completa com verificação fiscal SEFAZ e OCR no navegador
                     </p>
                   </div>
 
@@ -412,13 +502,13 @@ export default function App() {
                         {customFile ? customFile.name : selectedSample.submission.filename}
                         {customFile && (
                           <span className="px-1.5 py-0.2 rounded bg-blue-100 text-blue-800 text-[10px] font-bold">
-                            Arquivo Novo
+                            Arquivo Novo Enviado
                           </span>
                         )}
                       </div>
                       <div className="text-[11px] text-slate-500">
                         {customFile
-                          ? `Comprovante pessoal (${customFile.sizeKb} KB, ${customFile.dimensions ? `${customFile.dimensions.width}x${customFile.dimensions.height}` : customFile.fileType})`
+                          ? `Comprovante pessoal (${customFile.sizeKb} KB, ${customFile.dimensions ? `${customFile.dimensions.width}x${customFile.dimensions.height} px` : customFile.fileType})`
                           : `${selectedSample.label} (${selectedSample.submission.fileSizeKb} KB)`}
                       </div>
                     </div>
@@ -520,82 +610,103 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 2: FLOWCHART ARCHITECTURE */}
+        {/* TAB 2: FULL FLOWCHART SPECIFICATION */}
         {activeTab === 'flowchart' && (
           <div className="space-y-6">
             <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-xs space-y-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <h2 className="text-lg font-bold text-slate-900">
-                    Arquitetura Completa: OCR / Comprovante para Reembolso Bluepay
+                  <h2 className="text-base font-bold text-slate-900">
+                    Fluxograma Oficial de OCR & Reembolso — IA (Bluepay)
                   </h2>
                   <p className="text-xs text-slate-500">
-                    Diagrama interativo e trilha de auditoria seguindo rigorosamente o modelo
-                    especificado em fluxoograma_ocr.png
+                    Mapeamento estrito dos 22 nós, ramificações de decisão e critérios de auditoria
                   </p>
                 </div>
-                <div className="px-3 py-1 rounded-full bg-blue-50 text-blue-700 font-bold text-xs border border-blue-200">
-                  Estrito Cumprimento de Fluxo
-                </div>
+                <span className="text-xs font-bold text-blue-700 bg-blue-100 px-3 py-1 rounded-full">
+                  Fonte da Verdade
+                </span>
+              </div>
+
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-700 leading-relaxed space-y-2">
+                <p>
+                  <strong>Regras Mandatórias Implementadas:</strong>
+                </p>
+                <ul className="list-disc list-inside space-y-1 text-slate-600">
+                  <li>
+                    <strong>Nó 1 a 3:</strong> Envio do Comprovante $\rightarrow$ Verificar Qualidade $\rightarrow$ Qualidade Suficiente? (NÃO $\rightarrow$ Solicitar Novo Envio).
+                  </li>
+                  <li>
+                    <strong>Nó 4 a 6:</strong> Dentro do Prazo de 30 dias? (NÃO $\rightarrow$ Reprovado) $\rightarrow$ Verificar Duplicidade de Arquivo/Chave (SIM $\rightarrow$ Reprovado).
+                  </li>
+                  <li>
+                    <strong>Nó 7 a 11:</strong> QR Code/Chave Disponível? (SIM $\rightarrow$ Leitura $\rightarrow$ Validação Fiscal SEFAZ $\rightarrow$ Consulta Realizada? NÃO $\rightarrow$ Exceção Notificar RH $\rightarrow$ Análise Humana $\rightarrow$ Doc Fiscal Válido? NÃO $\rightarrow$ Análise Humana).
+                  </li>
+                  <li>
+                    <strong>Nó 12 a 16:</strong> Processamento com IA $\rightarrow$ Dados Estruturados $\rightarrow$ Dados Suficientes? (NÃO $\rightarrow$ Análise Humana) $\rightarrow$ Divergências Críticas? (SIM $\rightarrow$ Análise Humana) $\rightarrow$ IA Segura &ge; 98%? (NÃO $\rightarrow$ Análise Humana).
+                  </li>
+                  <li>
+                    <strong>Nó 17 a 20:</strong> Regras de Reembolso $\rightarrow$ Calcular Valor Elegível (Nenhum valor elegível $\rightarrow$ Reprovado) $\rightarrow$ Suspeita Relevante de Fraude? (SIM $\rightarrow$ Análise Humana; NÃO $\rightarrow$ Decisão Automática: Aprovado ou Aprovado Parcialmente).
+                  </li>
+                  <li>
+                    <strong>Nó 21 e 22:</strong> Análise Humana $\rightarrow$ Resultado / Status Final com Notificação e Livro de Auditoria.
+                  </li>
+                </ul>
               </div>
 
               <FlowchartVisualizer
-                currentStepId={currentStepId}
+                currentStepId={undefined}
                 executionTrail={activeResult?.executionTrail}
               />
             </div>
           </div>
         )}
 
-        {/* TAB 3: HUMAN REVIEW (Análise Humana) */}
+        {/* TAB 3: HUMAN REVIEW QUEUE */}
         {activeTab === 'review' && (
           <div className="space-y-6">
             <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-xs space-y-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+                  <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
                     <UserCheck className="w-5 h-5 text-amber-600" />
-                    Fila de Análise Humana (Auditoria)
+                    Fila de Análise Humana (Auditor Financeiro)
                   </h2>
                   <p className="text-xs text-slate-500">
-                    Comprovantes retidos por dados insuficientes, baixa confiança (&lt; 98%), divergência
-                    de CPF, exceção SEFAZ ou suspeita fiscal.
+                    Comprovantes encaminhados para validação manual por exceção SEFAZ, divergência, baixa confiança IA (&lt;98%) ou suspeita de fraude
                   </p>
                 </div>
-                <span className="px-3 py-1 rounded-full bg-amber-100 text-amber-900 font-bold text-xs border border-amber-300">
-                  {pendingReviewCount} pendente{pendingReviewCount === 1 ? '' : 's'}
+
+                <span className="text-xs font-bold text-amber-800 bg-amber-100 px-3 py-1 rounded-full">
+                  {pendingReviewCount} Pendente{pendingReviewCount !== 1 ? 's' : ''}
                 </span>
               </div>
 
               {pendingReviewCount === 0 ? (
-                <div className="p-12 text-center text-slate-400 text-xs italic bg-slate-50 rounded-xl border border-dashed border-slate-200 space-y-2">
-                  <CheckCircle2 className="w-8 h-8 text-emerald-500 mx-auto" />
-                  <div className="font-bold text-slate-700">Nenhum comprovante pendente de análise humana!</div>
-                  <div>Todos os envios foram aprovados automaticamente ou já auditados.</div>
+                <div className="text-center py-12 text-slate-500 text-xs bg-slate-50 rounded-xl border border-dashed border-slate-200">
+                  <CheckCircle2 className="w-8 h-8 text-emerald-500 mx-auto mb-2" />
+                  Nenhum comprovante pendente de análise humana no momento.
                 </div>
               ) : (
-                <div className="space-y-4">
+                <div className="space-y-3">
                   {historyRecords
                     .filter((r) => r.humanReviewRequired)
                     .map((item) => (
                       <div
                         key={item.submissionId}
-                        className="p-4 rounded-xl border border-amber-200 bg-amber-50/40 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4"
+                        className="p-4 rounded-xl border border-amber-200 bg-amber-50/40 flex flex-col md:flex-row items-start md:items-center justify-between gap-4"
                       >
                         <div className="space-y-1">
                           <div className="flex items-center gap-2">
-                            <span className="font-mono font-bold text-xs text-slate-700">
-                              #{item.submissionId}
+                            <span className="font-mono text-xs font-bold text-slate-800">
+                              {item.submissionId}
                             </span>
-                            <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-800 text-[11px] font-bold">
-                              {item.status}
-                            </span>
-                            <span className="text-xs font-semibold text-slate-900">
-                              {item.employeeName} ({item.employeeCpf})
+                            <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded bg-amber-200 text-amber-900">
+                              {item.humanReviewReason || 'Encaminhado para Análise'}
                             </span>
                           </div>
-                          <div className="text-xs text-slate-700 font-medium">
-                            {item.reason}
+                          <div className="text-xs font-semibold text-slate-900">
+                            {item.employeeName} ({item.employeeCpf || 'Sem CPF'}) • {item.structuredData?.issuerName || 'Emissor a conferir'}
                           </div>
                           <div className="text-[11px] text-slate-500">
                             Valor Comprovado: R$ {item.provenAmount.toFixed(2)} • Categoria:{' '}
@@ -619,14 +730,31 @@ export default function App() {
 
         {/* TAB 4: AUDIT LEDGER */}
         {activeTab === 'audit' && (
-          <AuditTrailTable
-            records={historyRecords}
-            onSelectRecord={(r) => {
-              setActiveResult(r);
-              setActiveTab('runner');
-            }}
-            onOpenReview={(r) => setReviewModalTarget(r)}
-          />
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Livro de Registro & Auditoria Fiscal</h3>
+                <p className="text-xs text-slate-500">Histórico completo de submissões e decisões persistidas no navegador</p>
+              </div>
+              {historyRecords.length > 0 && (
+                <button
+                  onClick={handleClearHistory}
+                  className="px-3 py-1.5 rounded-lg border border-slate-300 text-slate-600 hover:text-rose-600 hover:bg-rose-50 text-xs font-medium transition flex items-center gap-1.5"
+                >
+                  <Trash2 className="w-3.5 h-3.5" /> Limpar Histórico
+                </button>
+              )}
+            </div>
+
+            <AuditTrailTable
+              records={historyRecords}
+              onSelectRecord={(r) => {
+                setActiveResult(r);
+                setActiveTab('runner');
+              }}
+              onOpenReview={(r) => setReviewModalTarget(r)}
+            />
+          </div>
         )}
 
         {/* TAB 5: SEFAZ & POLICY SETTINGS */}
@@ -693,7 +821,7 @@ export default function App() {
 
       {/* FOOTER */}
       <footer className="bg-white border-t border-slate-200 py-4 px-6 text-center text-xs text-slate-500">
-        Bluepay — OCR / Comprovante para Reembolso — IA • Arquitetura Fiel ao Fluxograma
+        Bluepay — OCR / Comprovante para Reembolso — IA • Arquitetura 100% Frontend (Strict Flowchart)
       </footer>
 
       {/* Human Review Decision Modal */}
